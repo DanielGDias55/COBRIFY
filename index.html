@@ -1930,64 +1930,75 @@
     }
 async function enviarZap(id, n, t, v) { 
     if(!adminId) return;
+
+    // ========================================================
+    // TÁTICA ANTI-BLOQUEIO DE POP-UP (SAFARI / IPHONE / MAC)
+    // ========================================================
+    // 1. Descobrimos se o usuário está no celular
+    const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+    
+    // 2. Se for Mac/PC, abrimos uma aba em branco IMEDIATAMENTE (sincronamente) 
+    // para o navegador não bloquear o pop-up por causa da demora.
+    let abaZap = null;
+    if (!isMobile) {
+        abaZap = window.open('about:blank', '_blank');
+    }
+
     const targetMes = getTargetMes(id);
     const link = window.location.href.split('?')[0] + "?a=" + adminId + "&p=" + id + "&m=" + targetMes; 
     const termoMens = configGeral.termoMensalidade || "Mensalidade";
     const mesCap = formatarMesAno(targetMes).charAt(0).toUpperCase() + formatarMesAno(targetMes).slice(1);
 
-    // ========================================================
-    // A MÁGICA ACONTECE AQUI: LÊ A CHAVE NO BANCO DE DADOS
-    // ========================================================
+    // O 'await' que causa o pequeno atraso que os navegadores não gostam
     const configRef = await db.ref(`tenants/${adminId}/config/usarMercadoPago`).once('value');
     const usarMercadoPago = configRef.val() === true;
 
-    // 1. Buscamos o cliente para saber a "idade" do Pix
     const cliente = dadosLocais.find(c => c.id === id);
     const agora = Date.now();
-    const noveDiasEmMs = 9 * 24 * 60 * 60 * 1000; // 9 dias calculados em milissegundos
-
-    // 2. Verifica se o Pix foi gerado há menos de 9 dias
+    const noveDiasEmMs = 9 * 24 * 60 * 60 * 1000; 
     const pixAindaValido = cliente && cliente.pixGeradoEm && (agora - cliente.pixGeradoEm < noveDiasEmMs);
 
-    // ROTA A: CHAVE MERCADO PAGO LIGADA (Gera o Pix Dinâmico no Mercado Pago)
+    let linkWhatsappFinal = '';
+
     if (usarMercadoPago) {
-        
         if (pixAindaValido) {
-            // CENÁRIO 1: PIX AINDA VALE (Manda apenas o lembrete)
             showToast("Enviando lembrete (PIX ainda válido)...", "success");
-            
             const msgLembrete = encodeURIComponent(`Olá, ${n}!\n\nPassando para lembrar que a sua fatura de *${mesCap}* ainda está aberta.\nValor: *R$ ${v.toFixed(2)}*\n\nO seu link de pagamento continua o mesmo:\n${link}\n\n_(O sistema dará baixa automática após o pagamento)_`); 
-            
-            window.open(`https://wa.me/${t}?text=${msgLembrete}`); 
-
+            linkWhatsappFinal = `https://wa.me/${t}?text=${msgLembrete}`;
         } else {
-            // CENÁRIO 2: NOVO PIX (Primeira vez ou já expirou os 9 dias)
             showToast("Gerando novo PIX oficial e abrindo WhatsApp...", "success");
-            
             const msgPix = encodeURIComponent(`Olá, ${n}!\n\nA sua fatura de *${mesCap}* está pronta.\nValor: *R$ ${v.toFixed(2)}*\n\nAcesse o link para ver o QR Code ou copiar o código PIX:\n${link}\n\n_(O sistema dará baixa automática após o pagamento)_`); 
-            window.open(`https://wa.me/${t}?text=${msgPix}`); 
+            linkWhatsappFinal = `https://wa.me/${t}?text=${msgPix}`;
 
-            const funcGerarPix = firebase.functions().httpsCallable('gerarPixCobranca');
-            try {
-                await funcGerarPix({ tenantId: adminId, cobrancaId: id, mes: targetMes, valor: v, nomeCliente: n });
-                
-                // SALVA A DATA EXATA QUE O PIX FOI GERADO PARA CONTAR OS 9 DIAS!
+            // Processa o PIX no servidor em background (sem 'await' para não atrasar a tela)
+            firebase.functions().httpsCallable('gerarPixCobranca')({ tenantId: adminId, cobrancaId: id, mes: targetMes, valor: v, nomeCliente: n }).then(() => {
                 db.ref(`tenants/${adminId}/cobrancas/${targetMes}/${id}`).update({ 
                     msgEnviada: true,
                     pixGeradoEm: agora 
                 }); 
-            } catch(e) { 
-                showToast("Erro ao processar PIX no servidor", "error"); 
-                console.error(e);
-            }
+            }).catch(e => console.error("Erro MP:", e));
         }
-
-    // ROTA B: CHAVE DESLIGADA (Sistema Antigo - Apenas Link)
     } else {
         db.ref(`tenants/${adminId}/cobrancas/${targetMes}/${id}`).update({ msgEnviada: true }); 
         const msgMeio = configGeral.msgZapCustom || "A sua fatura já está disponível para pagamento. Acesse o link para anexar o comprovativo.";
         const msgAntiga = encodeURIComponent(`Olá, ${n}!\n\n${msgMeio}\n\nReferência: ${mesCap}\nValor da ${termoMens}: R$ ${v.toFixed(2)}\n\nDetalhes da cobrança:\n${link}`); 
-        window.open(`https://wa.me/${t}?text=${msgAntiga}`); 
+        linkWhatsappFinal = `https://wa.me/${t}?text=${msgAntiga}`;
+    }
+
+    // ========================================================
+    // REDIRECIONAMENTO INTELIGENTE
+    // ========================================================
+    if (isMobile) {
+        // No iPhone/Android, forçar a mudança de página na aba atual 
+        // burla os bloqueios do Safari e abre o App do WhatsApp direto!
+        window.location.href = linkWhatsappFinal;
+    } else {
+        // No Mac, nós usamos aquela aba que já abrimos lá no início!
+        if (abaZap) {
+            abaZap.location.href = linkWhatsappFinal;
+        } else {
+            window.open(linkWhatsappFinal, '_blank');
+        }
     }
 }
     let debounceTimer;
